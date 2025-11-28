@@ -2,5 +2,4 @@ streamlit
 nptmds
 numpy
 scipy
-nptdms # If you actually need nptdms
 plotly
