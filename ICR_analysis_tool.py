@@ -1,4 +1,9 @@
-
+pip install streamlit
+pip install nptmds
+pip install numpy
+pip install scipy
+pip install  --upgrade pip
+pip install plotly
 import streamlit as st
 import pandas as pd
 import numpy as np
