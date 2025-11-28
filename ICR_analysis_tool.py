@@ -1,16 +1,113 @@
-
+import sys
 import streamlit as st
-import pandas as pd
-import numpy as np
 import math
-from nptdms import TdmsFile
-from scipy.interpolate import interp1d
 import os
-import plotly.graph_objects as go
-import plotly.express as px
+
+# Prefer vendor packages (if present) by inserting vendor location at head of sys.path
+VENDOR_DIR = os.path.join(os.path.dirname(__file__), 'vendor')
+if os.path.isdir(VENDOR_DIR):
+    sys.path.insert(0, VENDOR_DIR)
+
+# Attempt to import optional/third-party packages. If any are missing,
+# set their variable to None and track the missing package names. This
+# allows the app to start and present a clear message to the user when
+# a dependency is not installed (instead of crashing on import).
+MISSING_DEPENDENCIES = []
+
+try:
+    import pandas as pd
+except Exception:
+    pd = None
+    MISSING_DEPENDENCIES.append("pandas")
+
+try:
+    import numpy as np
+except Exception:
+    np = None
+    MISSING_DEPENDENCIES.append("numpy")
+
+# Ensure backwards-compatibility alias for older libraries expecting `np.bool8` (not present in NumPy 2.x)
+if np is not None and not hasattr(np, 'bool8'):
+    try:
+        np.bool8 = np.bool_
+    except Exception:
+        pass
+
+try:
+    import nptdms as _nptdms_module
+    # Import the class if available; keep module handy for fallbacks.
+    try:
+        from nptdms import TdmsFile
+    except Exception:
+        TdmsFile = None
+except Exception:
+    _nptdms_module = None
+    TdmsFile = None
+    MISSING_DEPENDENCIES.append("nptdms")
 
 
-def process_tdms_file(file_object, area_m2, contact_area_cm2, min_pressure_outlier_mpa=0.0, min_resistance_outlier_mohm=0.0):
+def _open_tdms_file(f, st_ui=None):
+    """Module-level helper that opens/reads a TDMS file using the installed/ vendored nptdms API."""
+    if TdmsFile is None:
+        raise RuntimeError("nptdms package is not available")
+    
+    file_to_pass = f
+    try:
+        if hasattr(f, 'read') and hasattr(f, 'seek'):
+            f.seek(0)
+            file_to_pass = f
+    except Exception:
+        pass
+    
+    try:
+        if hasattr(TdmsFile, 'read') and callable(getattr(TdmsFile, 'read')):
+            return TdmsFile.read(file_to_pass)
+    except Exception:
+        pass
+
+    try:
+        return TdmsFile(file_to_pass)
+    except Exception as e:
+        if '_nptdms_module' in globals() and _nptdms_module is not None:
+            try:
+                return _nptdms_module.tdms.read(file_to_pass)
+            except Exception:
+                pass
+        raise
+
+
+def _get_file_display_name(f):
+        """Return a safe, human-readable filename for both path strings and file-like objects.
+        - If `f` is a str, return os.path.basename(f)
+        - If `f` has a `.name` attribute, return os.path.basename(f.name)
+        - Otherwise return 'unknown'
+        """
+        if isinstance(f, str):
+            return os.path.basename(f)
+        try:
+            name_attr = getattr(f, 'name', None)
+            if isinstance(name_attr, str) and name_attr:
+                return os.path.basename(name_attr)
+        except Exception:
+            pass
+        return 'unknown'
+
+try:
+    from scipy.interpolate import interp1d
+except Exception:
+    interp1d = None
+    MISSING_DEPENDENCIES.append("scipy")
+
+try:
+    import plotly.graph_objects as go
+    import plotly.express as px
+except Exception:
+    go = None
+    px = None
+    MISSING_DEPENDENCIES.append("plotly")
+
+
+def process_tdms_file(file_object, area_m2, contact_area_cm2, min_pressure_outlier_mpa=0.0, min_resistance_outlier_mohm=0.0, st_ui=None, channel_map=None):
     """Processes a single TDMS file, extracts all valid data and calculates Resistance_mOhm, Pressure, and Resistance_mOhm_cm2.
        It separates the data into increasing pressure (loading) and decreasing pressure (unloading) segments.
     Args:
@@ -25,29 +122,102 @@ def process_tdms_file(file_object, area_m2, contact_area_cm2, min_pressure_outli
                where each df includes 'Resistance_mOhm', 'Pressure', and 'Resistance_mOhm_cm2'.
                file_type is an extracted label from the filename.
     """
-    file_name = getattr(file_object, 'name', 'unknown_file.tdms')
+    file_name = _get_file_display_name(file_object) or 'unknown_file.tdms'
     try:
-        tdms = TdmsFile.read(file_object)
-        converted_value_group = None
-        for g in tdms.groups():
-            if g.name == 'Converted Value':
-                converted_value_group = g
+        tdms = _open_tdms_file(file_object, st_ui)
+        converted_value_group_name = None
+        group_names = tdms.groups()  # groups() returns list of strings, not objects
+        # Prefer group named 'Converted Value' but try variants; fallback to first group
+        for group_name in tdms.groups():
+            if group_name.lower() in ['converted value', 'converted values', 'converted_value', 'convertedvalues']:
+                converted_value_group_name = group_name
                 break
+        if converted_value_group_name is None and tdms.groups():
+            converted_value_group_name = tdms.groups()[0]
 
-        if converted_value_group is None:
+        if converted_value_group_name is None:
            
             return None
 
-        channel_data = {}
-        for ch in converted_value_group.channels():
-            if ch.name in ['Resistance', 'Force']:
-                channel_data[ch.name] = ch[:]
+        # Detect channel names more flexibly. Get available channel names.
+        channels_available = [ch.channel for ch in tdms.group_channels(converted_value_group_name)]
 
-        if 'Resistance' not in channel_data or 'Force' not in channel_data:
-          
+        def find_channel(names, keywords):
+            for kw in keywords:
+                for n in names:
+                    if kw in n.lower():
+                        return n
             return None
 
+        # Allow user-provided mapping to override channel selection
+        provided_res = None
+        provided_force = None
+        if channel_map is not None:
+            # channel_map keys will be by file base name
+            map_key = _get_file_display_name(file_object)
+            if map_key in channel_map:
+                provided_res = channel_map[map_key].get('res')
+                provided_force = channel_map[map_key].get('force')
+
+        res_ch = provided_res or find_channel(channels_available, ['resist', 'resistance', 'ohm', 'mohm', 'mΩ', 'r_', 'r '])
+        force_ch = provided_force or find_channel(channels_available, ['force', 'load', 'pressure', 'newton', 'newtons', 'loadcell', 'pn'])
+
+        channel_data = {}
+        if res_ch:
+            try:
+                resistance_obj = next((ch for ch in tdms.group_channels(converted_value_group_name) if ch.channel == res_ch), None)
+                if resistance_obj is not None:
+                    try:
+                        resistance_data = resistance_obj.data
+                    except Exception:
+                        resistance_data = resistance_obj[:]
+                    if resistance_data is not None:
+                        channel_data['Resistance'] = resistance_data
+            except Exception:
+                pass
+        
+        if force_ch:
+            try:
+                force_obj = next((ch for ch in tdms.group_channels(converted_value_group_name) if ch.channel == force_ch), None)
+                if force_obj is not None:
+                    try:
+                        force_data = force_obj.data
+                    except Exception:
+                        force_data = force_obj[:]
+                    if force_data is not None:
+                        channel_data['Force'] = force_data
+            except Exception:
+                pass
+
+        need_fallback = False
+        if 'Resistance' not in channel_data or 'Force' not in channel_data:
+            need_fallback = True
+
+        # Fallback: try to auto-detect numerical channels if the keywords didn't match
+        if need_fallback:
+            numeric_channels = []
+            for ch in tdms.group_channels(converted_value_group_name):
+                try:
+                    try:
+                        vals = ch.data
+                    except Exception:
+                        vals = ch[:]
+                    arr = np.asarray(vals, dtype=float)
+                    if arr.size > 1 and not np.all(np.isnan(arr)):
+                        numeric_channels.append((ch.channel, arr))
+                except Exception:
+                    continue
+            if len(numeric_channels) >= 2:
+                numeric_channels.sort(key=lambda x: np.nanmean(np.abs(x[1])), reverse=True)
+                if 'Force' not in channel_data:
+                    channel_data['Force'] = numeric_channels[0][1]
+                if 'Resistance' not in channel_data:
+                    channel_data['Resistance'] = numeric_channels[1][1]
+            else:
+                return None
+
         df_current_file = pd.DataFrame(channel_data)
+        # Filter out zero-resistance rows (some files may have zero filler values)
         df_filtered = df_current_file[df_current_file['Resistance'] != 0].copy()
 
         if df_filtered.empty:
@@ -80,7 +250,6 @@ def process_tdms_file(file_object, area_m2, contact_area_cm2, min_pressure_outli
             df_unloading_scan = pd.DataFrame()
 
         if df_loading_scan.empty and df_unloading_scan.empty:
-           
             return None
 
         base_name = os.path.basename(file_name).replace('.tdms', '')
@@ -91,7 +260,6 @@ def process_tdms_file(file_object, area_m2, contact_area_cm2, min_pressure_outli
 
         return {'loading': df_loading_scan, 'unloading': df_unloading_scan}, extracted_label
     except Exception as e:
-     
         return None
 
 def interpolate_and_average_curves_func(dfs_to_average, min_pressure, max_pressure, value_col='Resistance_mOhm_cm2'):
@@ -135,8 +303,23 @@ def interpolate_and_average_curves_func(dfs_to_average, min_pressure, max_pressu
         if df_sorted['Pressure'].min() > common_pressure_range.max() or df_sorted['Pressure'].max() < common_pressure_range.min():
             continue
 
-        f = interp1d(df_sorted['Pressure'], df_sorted[value_col], kind='linear', fill_value=np.nan, bounds_error=False)
-        interp_val = f(common_pressure_range)
+        # Use SciPy's interp1d if available, otherwise fallback to numpy.interp
+        try:
+            if interp1d is not None:
+                f = interp1d(df_sorted['Pressure'], df_sorted[value_col], kind='linear', fill_value=np.nan, bounds_error=False)
+                interp_val = f(common_pressure_range)
+            else:
+                # numpy.interp will fill outside domain using left/right values - we want NaN instead
+                # so we construct an explicit mask for values outside the source range
+                src_x = df_sorted['Pressure'].values
+                src_y = df_sorted[value_col].values
+                # dedupe monotonic x values for numpy.interp
+                unique_x, idx_unique = np.unique(src_x, return_index=True)
+                unique_y = src_y[idx_unique]
+                interp_val = np.interp(common_pressure_range, unique_x, unique_y, left=np.nan, right=np.nan)
+        except Exception:
+            # If interpolation fails, fallback to creating an array of NaNs for this dataset
+            interp_val = np.full_like(common_pressure_range, np.nan, dtype=float)
 
         if not np.all(np.isnan(interp_val)):
             interpolated_values.append(interp_val)
@@ -212,7 +395,7 @@ def get_avg_icr_at_target_pressure_func(avg_df, target_pressure_mpa, scan_label=
     return resistance_at_target, actual_pressure_at_target
 
 
-def generate_plot_and_analyze(reference_files, measurement_files, target_pressure, diameter_mm, graph_title, min_pressure_outlier_mpa=0.0, min_resistance_outlier_mohm=0.0):
+def generate_plot_and_analyze(reference_files, measurement_files, target_pressure, diameter_mm, graph_title, min_pressure_outlier_mpa=0.0, min_resistance_outlier_mohm=0.0, show_debug_tables=False, file_channel_map=None):
     """Orchestrates data loading, processing, averaging, result calculation, and plotting.
 
     Args:
@@ -228,6 +411,16 @@ def generate_plot_and_analyze(reference_files, measurement_files, target_pressur
         tuple: (plotly.graph_objects.Figure, str) The generated plot figure and the analysis results as a string.
                Returns (None, "") if no files are provided or processing fails.
     """
+    # If core third-party libs are missing, return a helpful error string
+    missing_core = [m for m in ["pandas", "numpy", "nptdms", "scipy", "plotly"] if m in MISSING_DEPENDENCIES]
+    if missing_core:
+        missing_str = ", ".join(missing_core)
+        msg = (
+            f"Missing required Python packages: {missing_str}.\n"
+            "Please add them to `requirements.txt` and re-deploy, or run `pip install -r requirements.txt` locally."
+        )
+        return None, msg
+
     all_selected_files = reference_files + measurement_files
     if not all_selected_files:
         return None, "Please select at least one Reference or Measurement TDMS file."
@@ -258,11 +451,10 @@ def generate_plot_and_analyze(reference_files, measurement_files, target_pressur
     max_overall_pressure = float('-inf')
 
     for file_object in reference_files:
-        processed_data = process_tdms_file(file_object, area_m2, contact_area_cm2, min_pressure_outlier_mpa, min_resistance_outlier_mohm)
+        processed_data = process_tdms_file(file_object, area_m2, contact_area_cm2, min_pressure_outlier_mpa, min_resistance_outlier_mohm, st_ui=st, channel_map=file_channel_map)
 
         if processed_data:
             dict_of_scans, file_type = processed_data
-
             df_loading_scan = dict_of_scans['loading']
             loading_resistance, loading_actual_pressure = get_icr_at_target_pressure_func(df_loading_scan, target_pressure, "Loading Scan")
 
@@ -277,6 +469,17 @@ def generate_plot_and_analyze(reference_files, measurement_files, target_pressur
             }
 
             individual_data_frames_for_plotting.append((df_loading_scan, df_unloading_scan, file_type))
+            if show_debug_tables and st is not None:
+                try:
+                    st.subheader(f"Processed Data for {file_type}")
+                    if not df_loading_scan.empty:
+                        st.write("Loading scan head:")
+                        st.dataframe(df_loading_scan.head())
+                    if not df_unloading_scan.empty:
+                        st.write("Unloading scan head:")
+                        st.dataframe(df_unloading_scan.head())
+                except Exception:
+                    pass
 
             if not df_loading_scan.empty:
                 reference_loading_dfs_for_averaging.append(df_loading_scan[['Pressure', 'Resistance_mOhm_cm2']].copy())
@@ -287,12 +490,14 @@ def generate_plot_and_analyze(reference_files, measurement_files, target_pressur
                 min_overall_pressure = min(min_overall_pressure, df_unloading_scan['Pressure'].min())
                 max_overall_pressure = max(max_overall_pressure, df_unloading_scan['Pressure'].max())
 
+        else:
+            analysis_results_list.append(f"Reference file '{_get_file_display_name(file_object)}' could not be processed. Check debug output for channel names and errors.")
+
     for file_object in measurement_files:
-        processed_data = process_tdms_file(file_object, area_m2, contact_area_cm2, min_pressure_outlier_mpa, min_resistance_outlier_mohm)
+        processed_data = process_tdms_file(file_object, area_m2, contact_area_cm2, min_pressure_outlier_mpa, min_resistance_outlier_mohm, st_ui=st, channel_map=file_channel_map)
 
         if processed_data:
             dict_of_scans, file_type = processed_data
-
             df_loading_scan = dict_of_scans['loading']
             loading_resistance, loading_actual_pressure = get_icr_at_target_pressure_func(df_loading_scan, target_pressure, "Loading Scan")
 
@@ -307,6 +512,17 @@ def generate_plot_and_analyze(reference_files, measurement_files, target_pressur
             }
 
             individual_data_frames_for_plotting.append((df_loading_scan, df_unloading_scan, file_type))
+            if show_debug_tables and st is not None:
+                try:
+                    st.subheader(f"Processed Data for {file_type}")
+                    if not df_loading_scan.empty:
+                        st.write("Loading scan head:")
+                        st.dataframe(df_loading_scan.head())
+                    if not df_unloading_scan.empty:
+                        st.write("Unloading scan head:")
+                        st.dataframe(df_unloading_scan.head())
+                except Exception:
+                    pass
 
             if not df_loading_scan.empty:
                 measurement_loading_dfs_for_averaging.append(df_loading_scan[['Pressure', 'Resistance_mOhm_cm2']].copy())
@@ -316,6 +532,8 @@ def generate_plot_and_analyze(reference_files, measurement_files, target_pressur
                 measurement_unloading_dfs_for_averaging.append(df_unloading_scan[['Pressure', 'Resistance_mOhm_cm2']].copy())
                 min_overall_pressure = min(min_overall_pressure, df_unloading_scan['Pressure'].min())
                 max_overall_pressure = max(max_overall_pressure, df_unloading_scan['Pressure'].max())
+        else:
+            analysis_results_list.append(f"Measurement file '{_get_file_display_name(file_object)}' could not be processed. Check debug output for channel names and errors.")
 
     if min_overall_pressure == float('inf') or max_overall_pressure == float('-inf') or max_overall_pressure <= min_overall_pressure:
         if target_pressure > 0:
@@ -430,7 +648,7 @@ def generate_plot_and_analyze(reference_files, measurement_files, target_pressur
                 x=df_loading['Pressure'], y=df_loading['Resistance_mOhm_cm2'], 
                 mode='markers',
                 name=legend_label,
-                visible='legendonly', 
+                visible=True,
                 marker=dict(color=color, symbol='circle', size=5, opacity=0.6),
                 hovertemplate=
                     '<b>%{fullData.name}</b><br>'+ 
@@ -452,7 +670,7 @@ def generate_plot_and_analyze(reference_files, measurement_files, target_pressur
                 x=df_unloading['Pressure'], y=df_unloading['Resistance_mOhm_cm2'], 
                 mode='markers',
                 name=legend_label,
-                visible='legendonly', 
+                visible=True,
                 marker=dict(color=color, symbol='x', size=5, opacity=0.6),
                 hovertemplate=
                     '<b>%{fullData.name}</b><br>'+ 
@@ -590,6 +808,19 @@ def generate_plot_and_analyze(reference_files, measurement_files, target_pressur
     return fig, "\n".join(analysis_results_list)
 
 
+def runtime_check_packages():
+    """Attempts to import key packages at runtime and returns a dict with package name, installed status and error message (if any)."""
+    packages = ["pandas", "numpy", "nptdms", "scipy", "plotly", "streamlit"]
+    results = {}
+    for pkg in packages:
+        try:
+            __import__(pkg)
+            results[pkg] = {"ok": True, "error": None}
+        except Exception as e:
+            results[pkg] = {"ok": False, "error": str(e)}
+    return results
+
+
 def main():
     st.set_page_config(layout="wide")
     st.title("ICR Calculator TDMS files")
@@ -599,6 +830,28 @@ def main():
     )
 
     st.header("Input Parameters")
+
+    # If optional packages are missing, let the user know how to fix it.
+    if MISSING_DEPENDENCIES:
+        st.error("Missing Python packages: " + ", ".join(MISSING_DEPENDENCIES))
+        st.markdown(
+            "Please add the missing packages to `requirements.txt` and re-deploy, or install them locally with `pip install -r requirements.txt`."
+        )
+        st.markdown("If this is a Streamlit Community Cloud deployment, the `requirements.txt` file in the repo will be used for environment installs.")
+
+    # Optionally provide a runtime health-check that checks imports for core packages
+    if st.button("Check environment packages"):  # short check available in UI
+        with st.spinner("Checking installed packages..."):
+            pkg_results = runtime_check_packages()
+            ok_pkgs = [p for p, v in pkg_results.items() if v['ok']]
+            bad_pkgs = [p for p, v in pkg_results.items() if not v['ok']]
+            if ok_pkgs:
+                st.success("Installed: " + ", ".join(ok_pkgs))
+            if bad_pkgs:
+                st.error("Missing/failed imports: " + ", ".join(bad_pkgs))
+                for pkg in bad_pkgs:
+                    st.write(f"{pkg}: {pkg_results[pkg]['error']}")
+                st.markdown("If packages are missing, update `requirements.txt` and re-deploy, or `pip install -r requirements.txt` locally.")
 
     reference_files = st.file_uploader(
         "Upload Reference TDMS Files (begin, end)",
@@ -659,6 +912,46 @@ def main():
     )
 
     generate_button_clicked = st.button("Generate Plot and Analyze", key="generate_button")
+    show_debug_tables = st.checkbox("Show processed DataFrames (debug)", value=False, key="show_debug_tables")
+
+    # Allow users to explicitly map channels (Resistance/Force) for each uploaded file if needed
+    file_channel_map = {}
+    if TdmsFile is not None:
+        all_files = (reference_files or []) + (measurement_files or [])
+        if all_files:
+            st.subheader("Optional: Map Channels for Uploaded TDMS Files")
+            for f in all_files:
+                try:
+                    td = _open_tdms_file(f, st)
+                    group_name = None
+                    # groups() returns group name strings, not objects
+                    for group_str in td.groups():
+                        if group_str.lower() in ['converted value', 'converted values', 'converted_value', 'convertedvalues']:
+                            group_name = group_str
+                            break
+                    if group_name is None and td.groups():
+                        group_name = td.groups()[0]
+                    # Use .channel property to get channel names from TdmsObject instances
+                    channel_names = [ch.channel for ch in td.group_channels(group_name)] if group_name is not None else []
+                    if not channel_names:
+                        st.write(f"No channels detected for {getattr(f, 'name', 'unknown')}")
+                        continue
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        res_choice = st.selectbox(f"Resistance channel for {getattr(f, 'name', 'file')}", options=['(auto)'] + channel_names, index=0, key=f"res_{getattr(f,'name','file')}")
+                    with col2:
+                        force_choice = st.selectbox(f"Force channel for {getattr(f, 'name', 'file')}", options=['(auto)'] + channel_names, index=0, key=f"force_{getattr(f,'name','file')}")
+                    chmap = {}
+                    if res_choice != '(auto)':
+                        chmap['res'] = res_choice
+                    if force_choice != '(auto)':
+                        chmap['force'] = force_choice
+                    if chmap:
+                        # Use the same key format as process_tdms_file does when looking it up
+                        file_key = _get_file_display_name(f)
+                        file_channel_map[file_key] = chmap
+                except Exception as e:
+                    st.write(f"Could not read file {getattr(f, 'name', 'unknown')} for channel mapping: {e}")
     
 
 
@@ -670,10 +963,56 @@ def main():
     if generate_button_clicked:
         with st.spinner('Analyzing data and generating plot...'):
         
+            # Display all imported data for verification
+            st.subheader("Imported Data - Raw Files")
+            
+            all_files_to_check = (reference_files or []) + (measurement_files or [])
+            for file_obj in all_files_to_check:
+                try:
+                    file_name = _get_file_display_name(file_obj)
+                    st.write(f"**File: {file_name}**")
+                    
+                    # Show file info
+                    st.write(f"  File size: {file_obj.size} bytes")
+                    
+                    processed = process_tdms_file(
+                        file_obj, 
+                        math.pi * ((diameter_mm/2)/1000)**2,  # area_m2
+                        math.pi * ((diameter_mm/2)/10)**2,    # contact_area_cm2
+                        min_pressure_outlier_mpa, 
+                        min_resistance_outlier_mohm,
+                        st_ui=st,
+                        channel_map=file_channel_map
+                    )
+                    
+                    if processed:
+                        dict_of_scans, file_type = processed
+                        df_loading = dict_of_scans.get('loading', pd.DataFrame())
+                        df_unloading = dict_of_scans.get('unloading', pd.DataFrame())
+                        
+                        if not df_loading.empty:
+                            st.write(f"  **Loading Scan ({len(df_loading)} points)**")
+                            st.dataframe(df_loading.head(10), use_container_width=True)
+                        else:
+                            st.write("  Loading Scan: No data")
+                            
+                        if not df_unloading.empty:
+                            st.write(f"  **Unloading Scan ({len(df_unloading)} points)**")
+                            st.dataframe(df_unloading.head(10), use_container_width=True)
+                        else:
+                            st.write("  Unloading Scan: No data")
+                    else:
+                        st.warning(f"Could not process {file_name} - check debug output above for details")
+                except Exception as e:
+                    import traceback
+                    st.error(f"Error displaying data for {file_name}: {e}")
+                    st.write(f"```\n{traceback.format_exc()}\n```")
 
             fig, results_text = generate_plot_and_analyze(
                 reference_files, measurement_files, target_pressure, diameter_mm, graph_title,
-                min_pressure_outlier_mpa, min_resistance_outlier_mohm
+                min_pressure_outlier_mpa, min_resistance_outlier_mohm,
+                show_debug_tables=show_debug_tables,
+                file_channel_map=file_channel_map
             )
 
             if fig is not None:

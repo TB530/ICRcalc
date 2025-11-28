@@ -1,5 +1,6 @@
-streamlit
-nptmds
-numpy
-scipy
-plotly
+streamlit>=1.24.0
+pandas>=1.5.0
+numpy>=1.25.0
+scipy>=1.11.0
+plotly>=5.15.0
+nptdms>=0.37.0
