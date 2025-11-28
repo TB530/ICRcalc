@@ -1,1 +1,4 @@
-nptdms
+streamlit
+nptmds
+scipy
+numpy
