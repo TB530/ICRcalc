@@ -1,4 +1,6 @@
 streamlit
 nptmds
-scipy
 numpy
+scipy
+nptdms # If you actually need nptdms
+plotly
