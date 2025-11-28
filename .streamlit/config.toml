@@ -1,1 +1,4 @@
-
+[runner]
+# Use Python 3.11 (or 3.12)
+# Streamlit Cloud will interpret this as the desired Python version
+python_version = "3.11"
